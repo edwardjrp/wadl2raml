@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+
+require "nokogiri"
+require "yaml"
+
+class Wadl2RamlConverter
+  attr_reader :doc
+  attr_reader :raml
+
+  def initialize
+  end
+
+  def convert(file)
+    @doc = Nokogiri::XML(File.read(file))
+    @raml = { "title" => file }
+    convert_resources
+    "#%RAML 1.0\n" +
+      YAML.dump(raml)
+        .sub("---\n", "")
+        .gsub(/"(\/[^"]*)"/, '\1')
+        .gsub(/'(!include [^']*)'/, '\1')
+  end
+
+  def convert_resources
+    resources = doc.at_css("resources")
+    raml["baseUri"] = resources["base"]
+    raml.merge!(convert_children(resources))
+  end
+
+  def path_fmt(path)
+    path[0] == "/" ? path : "/" + path
+  end
+
+  def convert_resource(node, acc)
+    resource_obj = {}
+    id = node["id"]
+    resource_obj["displayName"] = id if id
+
+    acc[path_fmt(node["path"])] = resource_obj.merge(convert_children(node))
+  end
+
+  def convert_type(raw_type)
+    type = raw_type.sub("xsd:", "")
+    case type
+    when "int", "Integer", "long"
+      "integer"
+    else
+      type
+    end
+  end
+
+  def convert_param(node, acc)
+    param_type = case node["style"]
+                 when "template"
+                   "uriParameters"
+                 when "query"
+                   "queryParameters"
+                 when "header"
+                   "headers"
+                 end
+    acc[param_type] ||= {}
+    param = {"type" => convert_type(node["type"])}
+    desc = node.css("doc").map(&:text).map(&:strip).join("\n\n")&.strip
+    param["description"] = desc if desc && !desc.empty?
+    param_name = node["name"]
+    param_name += "?" unless node["required"] == "true"
+    acc[param_type][param_name] = param
+  end
+
+  def convert_method(node, acc)
+    if node["href"]
+      qry = "[id='#{node["href"].sub('#', '')}']"
+      node = doc.at_css(qry)
+    end
+    method_name = node["name"].downcase
+    meth = {}
+    id = node["id"]
+    meth["displayName"] = id if id
+    acc[method_name] = meth.merge(convert_method_children(node))
+  end
+
+  def convert_representation_children(parent)
+    hash = parent.children.each_with_object({}) do |node, acc|
+      case node.name
+      when "doc"
+        acc["examples"] ||= {}
+        title = node["title"]
+        href_node = node.at_css("xsdxt|code")
+        if href_node
+          href = href_node["href"]
+          example = "!include \"#{href}\""
+          example = { "title" => title, "value" => example } if title
+          acc["examples"][acc["examples"].size + 1] = example
+        end
+      when "text"
+        text = node.text.strip
+        puts text unless text.empty?
+      else
+        puts "Representation #{node.name}"
+      end
+    end
+    if hash["examples"]
+      case hash["examples"].size
+      when 0
+        hash.delete("examples")
+      when 1
+        hash["example"] = hash["examples"].values.first
+        hash.delete("examples")
+      end
+    end
+    hash.empty? ? nil : hash
+  end
+
+  def convert_response_children(parent)
+    hash = parent.children.each_with_object({}) do |node, acc|
+      case node.name
+      when "representation"
+        acc["body"] ||= {}
+        media_type = node["mediaType"]
+        acc["body"][media_type] = convert_representation_children(node)
+      when "param"
+        convert_param(node, acc)
+      when "text"
+        text = node.text.strip
+        puts text unless text.empty?
+      else
+        puts "Response #{node.name}"
+      end
+    end
+    hash.empty? ? nil : hash
+  end
+
+  def convert_request_children(parent)
+    parent.children.each_with_object({}) do |node, acc|
+      case node.name
+      when "representation"
+        acc["body"] ||= {}
+        media_type = node["mediaType"]
+        acc["body"][media_type] = convert_representation_children(node)
+      when "param"
+        convert_param(node, acc)
+      when "text"
+        text = node.text.strip
+        puts text unless text.empty?
+      else
+        puts "Request #{node.name}"
+      end
+    end
+  end
+
+  def convert_method_children(parent)
+    obj = parent.children.each_with_object({}) do |node, acc|
+      case node.name
+      when "response"
+        acc["responses"] ||= {}
+        resp = convert_response_children(node)
+        acc["responses"].merge!(
+          node["status"].split(" ").each_with_object({}) { |status, acc| acc[status.to_i] = resp }
+        )
+      when "request"
+        acc.merge!(convert_request_children(node))
+      when "doc"
+        acc["description"] ||= []
+        text = process_text(node.text)
+        (acc["description"] << text) unless text.empty?
+      when "text"
+        text = node.text.strip
+        puts text unless text.empty?
+      else
+        puts "Method #{node.name}"
+      end
+    end
+    obj["description"] = concat_docs(obj["description"])
+    obj.delete("description") unless obj["description"]
+    obj
+  end
+
+  def concat_docs(ary)
+    result = ary.delete_if { |str| str.empty? }.join("\n\n")
+    result.empty? ? nil : result
+  end
+
+  def convert_children(parent)
+    parent.children.each_with_object({}) do |node, acc|
+      case node.name
+      when "resource"
+        convert_resource(node, acc)
+      when "param"
+        convert_param(node, acc)
+      when "method"
+        convert_method(node, acc)
+      when "text"
+        text = node.text.strip
+        puts text unless text.empty?
+      else
+        puts "Top #{node.name}"
+      end
+    end
+  end
+
+  def process_text(str)
+    str.gsub(/[\t\n]+/, " ").strip
+  end
+end
+
+ARGV.each do |in_file|
+  out_file = File.basename(in_file, ".*") + ".raml"
+
+  File.open(out_file, "w") do |f|
+    f.write Wadl2RamlConverter.new.convert(in_file)
+  end
+end
